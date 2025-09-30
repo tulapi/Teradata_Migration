@@ -35,17 +35,42 @@ def list_teradata_tables(database):
         print(f"[ERROR] Could not connect to Teradata or list tables for {database}: {e}", file=sys.stderr)
         return []
 
+
+
 def get_teradata_columns(database_name, table_name):
-    """Fetches the column names in order from the Teradata source."""
+    """Fetches column names and their data types in order from the Teradata source."""
     try:
         with teradatasql.connect(host=configg.TERADATA_HOST, user=configg.TERADATA_USER, password=configg.TERADATA_PASS) as conn:
             cur = conn.cursor()
-            query = f"SELECT ColumnName FROM DBC.ColumnsV WHERE DatabaseName='{database_name}' AND TableName='{table_name}' ORDER BY ColumnId;"
+            # --- MODIFICATION: Select ColumnType as well ---
+            query = f"""
+                SELECT ColumnName, ColumnType
+                FROM DBC.ColumnsV
+                WHERE DatabaseName='{database_name}' AND TableName='{table_name}'
+                ORDER BY ColumnId;
+            """
             cur.execute(query)
-            return [row[0] for row in cur.fetchall()]
+            # --- MODIFICATION: Return a list of tuples (name, type) ---
+            return cur.fetchall()
     except Exception as e:
         print(f"[ERROR] Could not get column list for {database_name}.{table_name}: {e}", file=sys.stderr)
         return []
+
+
+
+
+
+# def get_teradata_columns(database_name, table_name):
+#     """Fetches the column names in order from the Teradata source."""
+#     try:
+#         with teradatasql.connect(host=configg.TERADATA_HOST, user=configg.TERADATA_USER, password=configg.TERADATA_PASS) as conn:
+#             cur = conn.cursor()
+#             query = f"SELECT ColumnName FROM DBC.ColumnsV WHERE DatabaseName='{database_name}' AND TableName='{table_name}' ORDER BY ColumnId;"
+#             cur.execute(query)
+#             return [row[0] for row in cur.fetchall()]
+#     except Exception as e:
+#         print(f"[ERROR] Could not get column list for {database_name}.{table_name}: {e}", file=sys.stderr)
+#         return []
 
 def get_teradata_query_details(database_name, table_name, where_clause="", tracking_col=None):
     """Gets the row count and new max watermark for a given query from Teradata."""
@@ -183,7 +208,6 @@ def run_teradata_to_azure_tpt(table_name, database_name, log_func, migration_det
                 if os.path.exists(f):
                     try: os.remove(f)
                     except OSError as e: log_func(f"  [WARN] Could not remove temporary file {f}: {e}")
-
 def migrate_table(table_name, database_name, sf_cursor, log_func, migration_details):
     log_func(f"[DEBUG] Current Working Directory is: {os.getcwd()}")
     log_func("\n" + "=" * 70)
@@ -205,22 +229,23 @@ def migrate_table(table_name, database_name, sf_cursor, log_func, migration_deta
             result["success"] = True
             return result
 
-        log_func("  [TD] Getting source table schema...")
-        column_names = get_teradata_columns(database_name, table_name)
-        if not column_names:
-            log_func(f"[ERROR] Could not retrieve column names for '{table_name}'. Aborting Snowflake operations.")
+        log_func("  [TD] Getting source table schema with data types...")
+        # --- MODIFICATION: This variable now holds a list of (name, type) tuples ---
+        teradata_columns_with_types = get_teradata_columns(database_name, table_name)
+        log_func(f"  [DEBUG] Schema returned from Teradata: {teradata_columns_with_types}")
+        if not teradata_columns_with_types:
+            log_func(f"[ERROR] Could not retrieve column names and types for '{table_name}'. Aborting Snowflake operations.")
             return result
 
+        # --- MODIFICATION: Pass the new structure containing types to the create function ---
         pipe_name = sf_ops.create_table_and_pipe(
             sf_cursor, table_name, configg.SNOWFLAKE_DATABASE, 
             configg.SNOWFLAKE_SCHEMA, configg.SNOWFLAKE_STAGE_NAME, 
-            configg.SNOWFLAKE_FILE_FORMAT_NAME, database_name, column_names, log_func
+            configg.SNOWFLAKE_FILE_FORMAT_NAME, database_name, teradata_columns_with_types, log_func
         )
         if not pipe_name:
             return result
         
-        # --- THIS IS THE MODIFIED LINE ---
-        # We now pass 'rows_processed' to the verification function for the fallback check.
         pipe_success = sf_ops.refresh_and_verify_pipe(
             sf_cursor, pipe_name, table_name, configg.SNOWFLAKE_DATABASE, 
             configg.SNOWFLAKE_SCHEMA, database_name, rows_processed, log_func
@@ -233,6 +258,7 @@ def migrate_table(table_name, database_name, sf_cursor, log_func, migration_deta
         return result
 
     elif migration_type == 'Delta Load (Incremental)':
+        # This section remains unchanged as it works with an existing table schema.
         last_watermark = sf_ops.get_last_watermark(sf_cursor, table_name, log_func)
         log_func(f"[DELTA] Current watermark for '{table_name}' is: {last_watermark}")
         result["watermark_start"] = last_watermark
@@ -259,3 +285,84 @@ def migrate_table(table_name, database_name, sf_cursor, log_func, migration_deta
         return result
     
     return result
+
+
+
+
+
+
+# def migrate_table(table_name, database_name, sf_cursor, log_func, migration_details):
+#     log_func(f"[DEBUG] Current Working Directory is: {os.getcwd()}")
+#     log_func("\n" + "=" * 70)
+#     log_func(f"             Processing Table: {table_name.upper()}")
+#     log_func(f"             Mode: {migration_details['type']}")
+#     log_func("=" * 70)
+
+#     result = {"success": False, "rows_processed": 0, "watermark_start": None, "watermark_end": None}
+#     migration_type = migration_details['type']
+
+#     if migration_type == 'Full Load (Replaces table)':
+#         success, _, rows_processed = run_teradata_to_azure_tpt(table_name, database_name, log_func, migration_details)
+#         result["rows_processed"] = rows_processed
+#         if not success:
+#             return result
+        
+#         if rows_processed == 0:
+#             log_func("[SUCCESS] Table is empty. No Snowflake objects will be created.")
+#             result["success"] = True
+#             return result
+
+#         log_func("  [TD] Getting source table schema...")
+#         column_names = get_teradata_columns(database_name, table_name)
+#         if not column_names:
+#             log_func(f"[ERROR] Could not retrieve column names for '{table_name}'. Aborting Snowflake operations.")
+#             return result
+
+#         pipe_name = sf_ops.create_table_and_pipe(
+#             sf_cursor, table_name, configg.SNOWFLAKE_DATABASE, 
+#             configg.SNOWFLAKE_SCHEMA, configg.SNOWFLAKE_STAGE_NAME, 
+#             configg.SNOWFLAKE_FILE_FORMAT_NAME, database_name, column_names, log_func
+#         )
+#         if not pipe_name:
+#             return result
+        
+#         # --- THIS IS THE MODIFIED LINE ---
+#         # We now pass 'rows_processed' to the verification function for the fallback check.
+#         pipe_success = sf_ops.refresh_and_verify_pipe(
+#             sf_cursor, pipe_name, table_name, configg.SNOWFLAKE_DATABASE, 
+#             configg.SNOWFLAKE_SCHEMA, database_name, rows_processed, log_func
+#         )
+#         if not pipe_success:
+#             log_func(f"[ERROR] Data ingestion via Snowpipe for '{table_name}' failed or timed out.")
+#             return result
+
+#         result["success"] = True
+#         return result
+
+#     elif migration_type == 'Delta Load (Incremental)':
+#         last_watermark = sf_ops.get_last_watermark(sf_cursor, table_name, log_func)
+#         log_func(f"[DELTA] Current watermark for '{table_name}' is: {last_watermark}")
+#         result["watermark_start"] = last_watermark
+
+#         success, new_watermark, rows_processed = run_teradata_to_azure_tpt(table_name, database_name, log_func, migration_details, last_watermark)
+#         result["rows_processed"] = rows_processed
+#         if not success:
+#             return result
+        
+#         if rows_processed == 0:
+#             log_func("[SUCCESS] No new data to process. Table is up-to-date.")
+#             result["success"] = True
+#             result["watermark_end"] = last_watermark
+#             return result
+        
+#         result["watermark_end"] = new_watermark
+
+#         merge_success, _ = sf_ops.load_and_merge_delta(sf_cursor, table_name, database_name, log_func, migration_details)
+#         if not merge_success:
+#             return result
+        
+#         sf_ops.update_watermark(sf_cursor, table_name, new_watermark, log_func)
+#         result["success"] = True
+#         return result
+    
+#     return result
