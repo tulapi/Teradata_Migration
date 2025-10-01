@@ -40,6 +40,7 @@ def get_teradata_databases(_config):
         st.error(f"Error fetching Teradata databases: {e}")
         return []
 
+# getting terradata tables
 @st.cache_data(ttl=3600)
 def get_teradata_tables(_config, _selected_db):
     if not _selected_db: return []
